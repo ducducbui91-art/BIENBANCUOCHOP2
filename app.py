@@ -116,8 +116,7 @@ def add_formatted_text(paragraph: Paragraph, text: str, style_info=None):
 def _concat_runs(paragraph: Paragraph):
     meta, pos, buf = [], 0, []
     for r in paragraph.runs:
-        t = r.text or
- ""
+        t = r.text or ""
         start, end = pos, pos + len(t)
         meta.append((r, start, end))
         buf.append(t)
