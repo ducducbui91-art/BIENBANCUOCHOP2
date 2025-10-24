@@ -14,7 +14,12 @@ import smtplib, ssl
 from email.message import EmailMessage
 import google.generativeai as genai
 
-# --- CẤU HÌNH BẢO MẬT ---
+# NEW: đọc PDF
+from PyPDF2 import PdfReader
+
+# =========================
+# CẤU HÌNH BẢO MẬT
+# =========================
 try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
     APP_EMAIL      = st.secrets["APP_EMAIL"]
@@ -31,15 +36,23 @@ try:
 except Exception as e:
     st.error(f"Lỗi cấu hình Gemini API: {e}. Vui lòng kiểm tra lại API Key.")
 
-#======================================================================
-# PHẦN 1: HÀM XỬ LÝ (theo logic của .ipynb)
-#======================================================================
+# ======================================================================
+# PHẦN 1: HÀM XỬ LÝ (theo logic của .ipynb) + BỔ SUNG PDF + VALIDATION
+# ======================================================================
 
 # Regex y hệt notebook
 COMMENT_RE     = re.compile(r"\{#.*?#\}")                 # 1-run
 COMMENT_ALL_RE = re.compile(r"\{#.*?#\}", re.DOTALL)      # đa-run
 BOLD_RE        = re.compile(r"\*\*(.*?)\*\*")             # **bold**
 TOKEN_RE       = re.compile(r"\{\{([^{}]+)\}\}")          # {{Key}}
+
+def _ensure_seek_start(file_obj_or_path):
+    """Nếu là file-like stream, đưa con trỏ về đầu; nếu là path string thì bỏ qua."""
+    if hasattr(file_obj_or_path, "seek"):
+        try:
+            file_obj_or_path.seek(0)
+        except Exception:
+            pass
 
 def _is_md_table(text: str) -> bool:
     lines = [l.strip() for l in (text or "").strip().splitlines() if l.strip()]
@@ -81,7 +94,6 @@ def _insert_paragraph_after(anchor_para: Paragraph, style=None) -> Paragraph:
         try:
             new_para.style = style
         except Exception:
-            # Nếu style không tồn tại trong template thì bỏ qua
             pass
     return new_para
 
@@ -139,7 +151,6 @@ def _insert_table_after(paragraph: Paragraph, header, rows, table_style="New Tab
     try:
         tbl.style = table_style  # style có thể khác, tuỳ template
     except Exception:
-        # fallback: để mặc định
         pass
     # Header
     for i, h in enumerate(header):
@@ -159,6 +170,7 @@ def _insert_table_after(paragraph: Paragraph, header, rows, table_style="New Tab
 
 def extract_vars_and_desc(docx_file_or_buffer) -> Dict[str, str]:
     """Trích xuất placeholders {{Key}} {# mô tả #} từ .docx (đường dẫn hoặc buffer)."""
+    _ensure_seek_start(docx_file_or_buffer)
     xml_parts = []
     with zipfile.ZipFile(docx_file_or_buffer) as z:
         for name in z.namelist():
@@ -249,7 +261,6 @@ def replace_in_paragraph(paragraph: Paragraph, data: Dict[str, str]):
                     run_end.text = (run_end.text or "")[offset_end:]
                 continue
             except Exception:
-                # fallback về text thường
                 value = str(value)
 
         # BULLET LIST (dòng bắt đầu bằng '-' hoặc '+')
@@ -303,6 +314,7 @@ def replace_in_paragraph(paragraph: Paragraph, data: Dict[str, str]):
 def fill_template_to_buffer(template_file_or_path, data_input: Dict[str, str]):
     """Điền dữ liệu vào template và trả về BytesIO .docx (xử lý thân + bảng + header + footer)."""
     try:
+        _ensure_seek_start(template_file_or_path)
         doc = Document(template_file_or_path)
     except Exception as e:
         st.error(f"Lỗi mở template: {e}")
@@ -455,9 +467,27 @@ def send_email_with_attachment(recipient_email, attachment_buffer, filename="BBC
         st.error(f"Lỗi khi gửi email: {e}. Vui lòng kiểm tra lại cấu hình email và mật khẩu ứng dụng.")
         return False
 
-#======================================================================
+# NEW: Trích xuất text từ PDF
+def extract_text_from_pdf(pdf_file) -> str:
+    """
+    Trích xuất text từ PDF (text-based). Nếu PDF là scan ảnh, text có thể rỗng và bạn cần OCR.
+    """
+    try:
+        _ensure_seek_start(pdf_file)
+        reader = PdfReader(pdf_file)
+        texts = []
+        for page in reader.pages:
+            txt = page.extract_text() or ""
+            if txt:
+                texts.append(txt)
+        return "\n".join(texts).strip()
+    except Exception as e:
+        st.error(f"Lỗi đọc PDF: {e}")
+        return ""
+
+# ==============================================================
 # PHẦN 2: GIAO DIỆN STREAMLIT
-#======================================================================
+# ==============================================================
 
 st.set_page_config(layout="wide", page_title="Công cụ tạo Biên bản cuộc họp")
 st.title("🛠️ Công cụ tạo biên bản cuộc họp tự động")
@@ -466,52 +496,39 @@ with st.sidebar:
     st.info("📝 **Hướng dẫn sử dụng**")
     st.markdown("""
     1.  **Tải file transcript:** Tải lên file `.docx` chứa nội dung cuộc họp.
-    2.  **Chọn Template:**
+    2.  **(Khuyến nghị) Tải PDF attendance:** Tải lên file `.pdf` danh sách/attendance của cuộc họp.
+    3.  **Chọn Template:**
         * Sử dụng mẫu có sẵn bằng cách chọn "Template VPI".
         * Hoặc "Template tùy chỉnh" và tải file của bạn lên.
-    3.  **Điền thông tin:** Nhập các thông tin cơ bản của cuộc họp.
-    4.  **Nhập email:** Điền địa chỉ email bạn muốn nhận kết quả.
-    5.  **Chạy:** Nhấn nút 'Tạo biên bản'.
+    4.  **Điền thông tin bắt buộc:** Tên cuộc họp, thời gian, địa điểm, chủ trì, thư ký.
+    5.  **Nhập email:** Địa chỉ nhận kết quả.
+    6.  **Chạy:** Nhấn nút 'Tạo biên bản'.
     """)
 
-    
     st.info("📝 **Hướng dẫn tạo template**")
     st.markdown("""
-📂 File nhận đầu vào là file có đuôi `.docx`
+📂 File nhận đầu vào là file `.docx`
 Khi tạo template cho biên bản cuộc họp, bạn cần mô tả rõ từng biến để đảm bảo hệ thống hiểu đúng và điền thông tin chính xác. Mỗi biến cần tuân thủ cấu trúc sau: 
 {{Ten_bien}}{# Mo_ta_chi_tiet #}
 🔍 Trong đó:
 - ✅ {{Ten_bien}}:
-- Tên biến **viết bằng tiếng Anh hoặc tiếng Việt không dấu**.
-- **Không sử dụng dấu cách**. Nếu cần phân tách các từ, sử dụng **dấu gạch dưới (_)**
-- Dấu ngoặc nhọn kép ({{ và }}) phải **gắn liền với tên biến**, **không có khoảng trắng**.
-- Ví dụ hợp lệ: {{Thanh_phan_tham_du}}
+  - Tên biến **viết bằng tiếng Anh hoặc tiếng Việt không dấu**.
+  - **Không sử dụng dấu cách**. Nếu cần phân tách các từ, sử dụng **dấu gạch dưới (_)**.
+  - Ví dụ hợp lệ: {{Thanh_phan_tham_du}}
 - ✅ {# Mo_ta_chi_tiet #}:
-- Mở đầu bằng dấu {#, tiếp theo là nội dung mô tả, và kết thúc bằng dấu #}.
-- Nội dung mô tả phải nêu rõ:
-  - **Thông tin cần điền** vào biến là gì (dữ liệu nội dung).
-  - **Yêu cầu trình bày** dữ liệu như thế nào (ví dụ: dạng bảng, dạng bullet,...).
-  - **Cấu trúc trình bày:** chỉ hỗ trợ **hai cấp trình bày**:
-    - **Bullet cấp 1**: dùng cho ý chính
-    - **Bullet cấp 2**: dùng cho các ý nhỏ bổ sung dưới từng ý chính.
-🧾 Ví dụ cụ thể:
-{{Thanh_phan_tham_du}}{#Danh sách người tham gia cuộc họp, trình bày ở dạng bullet point. Ưu tiên sắp xếp từ lãnh đạo cấp cao, lãnh đạo bộ phận đến chuyên viên. Chỉ sử dụng tối đa 2 cấp trình bày: bullet 1 là tên từng người, bullet 2 là chức vụ hoặc vai trò nếu có.#}
+  - Nêu rõ **nội dung cần điền** và **yêu cầu trình bày** (bảng, bullet 1/2, đoạn văn...).
 
-- **🎨 Tạo định dạng hiển thị cho các bullet:**
-- 📍 Đối với bullet cấp 1:
-- Chọn **Styles Pane** ➜ **Tìm List Bullet** ➜ **Chỉnh sửa format** ➜ **Chọn add to template** ➜ **Nhấn OK**
-- 📍 Đối với bullet cấp 2:
-- Chọn **Styles Pane** ➜ **Tìm List Bullet 2** ➜ **Chọn Style type: Table** ➜ **Chỉnh sửa format** ➜ **Chọn add to template** ➜ **Nhấn OK**
-- 📍 Đối với bảng:
-- Chọn **Styles Pane** ➜ Chọn **New Style** ➜ **Chọn Style type: Table** ➜ **Chỉnh sửa format** ➜ Đổi tên thành `"New Table"` ➜ **Chọn add to template** ➜ **Nhấn OK**
-
+🎨 Định dạng:
+- **Bullet cấp 1**: Style `List Bullet`
+- **Bullet cấp 2**: Style `List Bullet 2`
+- **Bảng**: Style `New Table`
     """)
     st.markdown("---")
     st.success("Ứng dụng được phát triển bởi VPI.")
-    
-st.subheader("1. Nhập thông tin đầu vào")
 
-transcript_file = st.file_uploader("1. Tải lên file transcript (.docx)", type=["docx"])
+st.subheader("1. Nhập thông tin đầu vào")
+transcript_file = st.file_uploader("1. Tải lên file transcript (.docx) *", type=["docx"])
+attendance_pdf  = st.file_uploader("1.1. Tải lên file attendance (.pdf) (khuyến nghị)", type=["pdf"])
 
 st.subheader("2. Lựa chọn Template")
 template_option = st.selectbox(
@@ -521,88 +538,111 @@ template_option = st.selectbox(
 )
 template_file = None
 if template_option == "Template tùy chỉnh":
-    template_file = st.file_uploader("Tải lên file template .docx của bạn", type=["docx"])
+    template_file = st.file_uploader("Tải lên file template .docx của bạn *", type=["docx"])
 
-st.subheader("3. Thông tin cơ bản")
-# (MỚI) Chỉ hiện khi chọn Template tùy chỉnh
-if template_option == "Template tùy chỉnh":
-    st.info(
-        "🔔 **Lưu ý đối với Template tùy chỉnh**\n\n"
-        "- File template **bắt buộc** phải có đúng và đủ các biến sau, **đúng chính tả, không kèm mô tả `{# ... #}`**:\n"
-        "  `{{TenCuocHop}}`, `{{ThoiGianCuocHop}}`, `{{DiaDiemCuocHop}}`, `{{TenChuTri}}`, `{{TenThuKy}}`.\n"
-        "- Ví dụ **không hợp lệ**: `{{TenCuocHop}}{# ... #}` (không được kèm phần mô tả)."
-    )
-else:
-    st.caption("Các trường bắt buộc đã có sẵn trong Template VPI.")
+st.subheader("3. Thông tin cơ bản (BẮT BUỘC)")
 col1, col2 = st.columns(2)
 with col1:
-    meeting_name      = st.text_input("Tên cuộc họp")
-    meeting_time      = st.text_input("Thời gian cuộc họp (VD: 10/9/2025)")
-    meeting_location  = st.text_input("Địa điểm cuộc họp")
+    meeting_name      = st.text_input("Tên cuộc họp *")
+    meeting_time      = st.text_input("Thời gian cuộc họp (VD: 10/9/2025) *")
+    meeting_location  = st.text_input("Địa điểm cuộc họp *")
 with col2:
-    meeting_chair     = st.text_input("Tên chủ trì")
-    meeting_secretary = st.text_input("Tên thư ký")
+    meeting_chair     = st.text_input("Tên chủ trì *")
+    meeting_secretary = st.text_input("Tên thư ký *")
 
-recipient_email = st.text_input("4. Email nhận kết quả của bạn")
+recipient_email = st.text_input("4. Email nhận kết quả của bạn *")
 
+# ===============================
+# Nút chạy + VALIDATION BẮT BUỘC
+# ===============================
 if st.button("🚀 Tạo biên bản", type="primary"):
-    if not all([transcript_file, recipient_email, meeting_name]):
-        st.warning("Vui lòng tải lên file transcript và điền đầy đủ Tên cuộc họp, Email nhận kết quả.")
-    else:
-        # Xác định template
-        template_to_use = None
-        if template_option == "Template VPI":
-            default_path = "2025.VPI_BB hop 2025 1.docx"
-            if not os.path.exists(default_path):
-                st.error(f"Không tìm thấy template mặc định: {default_path}. Hãy chọn 'Template tùy chỉnh' và tải file lên.")
-            else:
-                template_to_use = default_path
-        elif template_file is not None:
-            template_to_use = template_file
+    # Kiểm tra bắt buộc
+    required_inputs = {
+        "File transcript (.docx)": transcript_file,
+        "Tên cuộc họp":           meeting_name,
+        "Thời gian cuộc họp":     meeting_time,
+        "Địa điểm cuộc họp":      meeting_location,
+        "Tên chủ trì":            meeting_chair,
+        "Tên thư ký":             meeting_secretary,
+        "Email nhận kết quả":     recipient_email,
+    }
+    missing = [label for label, val in required_inputs.items() if not val]
+    if template_option == "Template tùy chỉnh" and not template_file:
+        missing.append("File template (.docx) cho 'Template tùy chỉnh'")
+
+    if missing:
+        st.error("Thiếu thông tin bắt buộc: " + ", ".join(missing))
+        st.stop()  # Dừng hẳn không chạy tiếp
+
+    # Xác định template
+    template_to_use = None
+    if template_option == "Template VPI":
+        default_path = "2025.VPI_BB hop 2025 1.docx"
+        if not os.path.exists(default_path):
+            st.error(f"Không tìm thấy template mặc định: {default_path}. Hãy chọn 'Template tùy chỉnh' và tải file lên.")
+            st.stop()
         else:
-            st.warning("Bạn đã chọn 'Template tùy chỉnh' nhưng chưa tải file lên.")
+            template_to_use = default_path
+    else:
+        template_to_use = template_file  # đã đảm bảo không None ở trên
 
-        if template_to_use:
-            with st.spinner("⏳ Hệ thống đang xử lý..."):
-                try:
-                    st.info("1/4 - Đang đọc và phân tích transcript...")
-                    doc = Document(transcript_file)
-                    transcript_content = "\n".join([para.text for para in doc.paragraphs])
+    with st.spinner("⏳ Hệ thống đang xử lý..."):
+        try:
+            st.info("1/4 - Đang đọc và phân tích transcript...")
+            # Đọc DOCX transcript
+            _ensure_seek_start(transcript_file)
+            doc = Document(transcript_file)
+            transcript_content = "\n".join([para.text for para in doc.paragraphs]).strip()
 
-                    st.info("2/4 - Đang trích placeholders từ template...")
-                    placeholders = extract_vars_and_desc(template_to_use)
+            # Đọc PDF attendance (nếu có) và gộp
+            pdf_text = ""
+            if attendance_pdf is not None:
+                st.info("1.1/4 - Đang trích xuất text từ PDF attendance...")
+                pdf_text = extract_text_from_pdf(attendance_pdf)
+                if not pdf_text:
+                    st.warning("PDF attendance có vẻ là bản scan ảnh hoặc không trích xuất được text. "
+                               "Hãy dùng PDF text-based hoặc tích hợp OCR nếu cần.")
 
-                    st.info("3/4 - Đang gọi AI để trích xuất nội dung...")
-                    llm_result = call_gemini_model(transcript_content, placeholders)
+            combined_content = transcript_content
+            if pdf_text:
+                combined_content += "\n\n---\n[PHỤ LỤC: Attendance từ PDF]\n" + pdf_text
 
-                    if llm_result:
-                        # Ghi đè bằng input tay
-                        manual_inputs = {
-                            'TenCuocHop':    meeting_name,
-                            'ThoiGianCuocHop': meeting_time,
-                            'DiaDiemCuocHop':  meeting_location,
-                            'TenChuTri':       meeting_chair,
-                            'TenThuKy':        meeting_secretary
-                        }
-                        llm_result.update(manual_inputs)
+            st.info("2/4 - Đang trích placeholders từ template...")
+            _ensure_seek_start(template_to_use)
+            placeholders = extract_vars_and_desc(template_to_use)
 
-                        st.info("4/4 - Đang tạo file biên bản Word...")
-                        docx_buffer = fill_template_to_buffer(template_to_use, llm_result)
-                        if docx_buffer:
-                            st.success("✅ Tạo biên bản thành công!")
-                            st.download_button(
-                                "⬇️ Tải về biên bản",
-                                data=docx_buffer,
-                                file_name="Bienbancuochop.docx",
-                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                            )
-                            # Gửi email (nếu có)
-                            if recipient_email:
-                                if send_email_with_attachment(recipient_email, docx_buffer, filename="Bien_ban_cuoc_hop.docx"):
-                                    st.success("✉️ Đã gửi biên bản tới email của bạn.")
-                        else:
-                            st.error("Không thể tạo file Word. Vui lòng kiểm tra lại file template.")
-                    else:
-                        st.error("Không thể lấy kết quả từ AI. Vui lòng thử lại.")
-                except Exception as e:
-                    st.error(f"Đã xảy ra lỗi: {e}")
+            st.info("3/4 - Đang gọi AI để trích xuất nội dung (từ DOCX + PDF)...")
+            llm_result = call_gemini_model(combined_content, placeholders)
+
+            if llm_result:
+                # Ghi đè các trường bắt buộc từ input tay
+                manual_inputs = {
+                    'TenCuocHop':        meeting_name,
+                    'ThoiGianCuocHop':   meeting_time,
+                    'DiaDiemCuocHop':    meeting_location,
+                    'TenChuTri':         meeting_chair,
+                    'TenThuKy':          meeting_secretary
+                }
+                llm_result.update(manual_inputs)
+
+                st.info("4/4 - Đang tạo file biên bản Word...")
+                _ensure_seek_start(template_to_use)  # đảm bảo đọc lại template từ đầu
+                docx_buffer = fill_template_to_buffer(template_to_use, llm_result)
+                if docx_buffer:
+                    st.success("✅ Tạo biên bản thành công!")
+                    st.download_button(
+                        "⬇️ Tải về biên bản",
+                        data=docx_buffer,
+                        file_name="Bienbancuochop.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    )
+                    # Gửi email
+                    if recipient_email:
+                        if send_email_with_attachment(recipient_email, docx_buffer, filename="Bien_ban_cuoc_hop.docx"):
+                            st.success("✉️ Đã gửi biên bản tới email của bạn.")
+                else:
+                    st.error("Không thể tạo file Word. Vui lòng kiểm tra lại file template.")
+            else:
+                st.error("Không thể lấy kết quả từ AI. Vui lòng thử lại.")
+        except Exception as e:
+            st.error(f"Đã xảy ra lỗi: {e}")
