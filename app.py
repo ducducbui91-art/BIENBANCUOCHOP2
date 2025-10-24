@@ -116,7 +116,8 @@ def add_formatted_text(paragraph: Paragraph, text: str, style_info=None):
 def _concat_runs(paragraph: Paragraph):
     meta, pos, buf = [], 0, []
     for r in paragraph.runs:
-        t = r.text or ""
+        t = r.text or
+ ""
         start, end = pos, pos + len(t)
         meta.append((r, start, end))
         buf.append(t)
@@ -399,6 +400,7 @@ generation_config={"response_mime_type": "application/json"}
 )
 if response and hasattr(response, "text"):
 raw = response.text.strip()
+# Một số model bọc JSON trong json ...
 if raw.startswith(""): raw = raw.split("")[1].strip("json\n")
 return json.loads(raw)
 else:
@@ -447,18 +449,26 @@ st.title("🛠️ Công cụ tạo biên bản cuộc họp tự động")
 with st.sidebar:
 st.info("📝 Hướng dẫn sử dụng")
 st.markdown("""
-1. Tải file transcript: Tải lên file .docx chứa nội dung cuộc họp.
-2. Tải file attendance: Tải lên file .csv điểm danh (tham dự).
-3. Chọn Template:
-* Sử dụng mẫu có sẵn bằng cách chọn "Template VPI".
-* Hoặc "Template tùy chỉnh" và tải file của bạn lên.
-4. Điền thông tin: Nhập các thông tin cơ bản của cuộc họp.
-5. Nhập email: Điền địa chỉ email bạn muốn nhận kết quả.
-6. Chạy: Nhấn nút 'Tạo biên bản'.
+
+Tải file transcript: Tải lên file .docx chứa nội dung cuộc họp.
+
+Tải file attendance: Tải lên file .csv điểm danh (tham dự).
+
+Chọn Template:
+
+Sử dụng mẫu có sẵn bằng cách chọn Template VPI.
+
+Hoặc Template tùy chỉnh và tải file của bạn lên.
+
+Điền thông tin: Nhập các thông tin cơ bản của cuộc họp.
+
+Nhập email: Điền địa chỉ email bạn muốn nhận kết quả.
+
+Chạy: Nhấn nút Tạo biên bản.
 """)
-st.info("📝 **Hướng dẫn tạo template**")
+st.info("📝 Hướng dẫn tạo template")
 st.markdown("""
-📂 File nhận đầu vào là file có đuôi .docx
+📂 File nhận đầu vào là file .docx
 Khi tạo template cho biên bản cuộc họp, bạn cần mô tả rõ từng biến để hệ thống hiểu đúng và điền thông tin chính xác:
 
 {{Ten_bien}}{# Mo_ta_chi_tiet #}
