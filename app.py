@@ -789,11 +789,12 @@ if st.button("🚀 Tạo biên bản", type="primary"):
 
                 st.info("3/5 - Phân tích CSV thành viên")
                 participants_hint = {"participants_bullets": "", "participants_table_md": ""}
-if csv_file is not None:
-    try:
-        participants_hint = parse_attendance_any(csv_file)
-    except Exception as e:
-        st.warning(f"Không đọc được CSV/Excel: {e}")
+
+    if csv_file is not None:
+        try:
+            participants_hint = parse_attendance_any(csv_file)
+        except Exception as e:
+            st.warning(f"Không đọc được CSV/Excel: {e}")
 
                 st.info("4/5 - Gọi AI tạo JSON theo placeholders (kết hợp transcript + CSV)")
                 llm_result = call_gemini_model(transcript_content, placeholders, participants_hint)
