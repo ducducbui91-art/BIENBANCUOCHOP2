@@ -584,10 +584,7 @@ def _attendance_df_to_struct(df: pd.DataFrame) -> Dict[str, str]:
             if mail_col: row.append(str(r.get(mail_col, "")).strip())
             rows.append(row)
         sep = "|" + "|".join(["---" for _ in headers]) + "|"
-        participants_table_md = "|" + "|".join(headers) + "|
-" + sep + "
-" + "
-".join(["|" + "|".join(r) + "|" for r in rows])
+        participants_table_md = "|" + "|".join(headers) + "|" + sep + "" + "".join(["|" + "|".join(r) + "|" for r in rows])
     else:
         participants_table_md = ""
 
