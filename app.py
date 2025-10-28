@@ -1,46 +1,76 @@
-# app.py
+# app_refactored.py
+# -*- coding: utf-8 -*-
+"""
+Ứng dụng Streamlit tạo biên bản cuộc họp từ transcript (.docx) + CSV thành viên tham dự.
+- Refactor mã gốc thành các hàm rõ ràng, dễ test, dễ tái sử dụng.
+- Bổ sung đầu vào .csv để kết hợp với transcript trước khi gửi sang AI.
+
+Yêu cầu thư viện (requirements.txt):
+    streamlit
+    pandas
+    python-docx
+    google-generativeai
+    openpyxl   # (đọc Excel nếu cần trong tương lai)
+
+Cách chạy (local):
+    streamlit run app_refactored.py
+
+Cấu trúc logic chính:
+  1) Upload transcript .docx + CSV thành viên + chọn template .docx
+  2) Trích placeholders từ template
+  3) Đọc transcript + CSV → tạo participants_hint
+  4) Gọi AI tạo JSON theo placeholders (ưu tiên dùng CSV cho trường liên quan thành viên)
+  5) Ghi đè một số trường thủ công (Tên cuộc họp, Chủ trì, Thư ký...)
+  6) Điền template → .docx → cho tải xuống và/hoặc gửi email
+"""
+
+from __future__ import annotations
+import io
+import os
+import re
+import json
+import zipfile
+import ssl
+import smtplib
+from typing import Dict, List, Optional, Tuple
+
 import streamlit as st
+import pandas as pd
 from docx import Document
 from docx.oxml import OxmlElement
 from docx.text.paragraph import Paragraph
-from docx.shared import Inches
-import re
-import os
-import json
-import zipfile
-from typing import Dict
-import io
-import smtplib, ssl
-from email.message import EmailMessage
+from docx.shared import Inches  # noqa: F401 (để sẵn nếu sau này cần chèn ảnh)
 import google.generativeai as genai
-import csv
 
-# --- CẤU HÌNH BẢO MẬT ---
+# =========================
+# CẤU HÌNH BẢO MẬT / API
+# =========================
 try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
     APP_EMAIL      = st.secrets["APP_EMAIL"]
     APP_PASSWORD   = st.secrets["APP_PASSWORD"]
 except Exception:
-    st.warning("Không tìm thấy Streamlit Secrets. Đang sử dụng cấu hình local. Đừng quên thiết lập Secrets khi deploy!")
-    GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"
-    APP_EMAIL      = "your_email@example.com"
-    APP_PASSWORD   = "your_app_or_email_password"
+    st.warning("Không tìm thấy Streamlit Secrets. Đang dùng cấu hình local thử nghiệm!")
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
+    APP_EMAIL      = os.getenv("APP_EMAIL", "your_email@example.com")
+    APP_PASSWORD   = os.getenv("APP_PASSWORD", "your_app_or_email_password")
 
-# Cấu hình API key cho Gemini
 try:
     genai.configure(api_key=GEMINI_API_KEY)
 except Exception as e:
     st.error(f"Lỗi cấu hình Gemini API: {e}. Vui lòng kiểm tra lại API Key.")
 
-#======================================================================
-# PHẦN 1: HÀM XỬ LÝ
-#======================================================================
+# =========================
+# HẰNG SỐ & REGEX PHỤ TRỢ
+# =========================
+COMMENT_RE     = re.compile(r"\{#.*?#\}")                # 1-run
+COMMENT_ALL_RE = re.compile(r"\{#.*?#\}", re.DOTALL)     # đa-run
+BOLD_RE        = re.compile(r"\*\*(.*?)\*\*")          # **bold**
+TOKEN_RE       = re.compile(r"\{\{([^{}]+)\}\}")       # {{Key}}
 
-# Regex
-COMMENT_RE     = re.compile(r"\{#.*?#\}")                 # 1-run
-COMMENT_ALL_RE = re.compile(r"\{#.*?#\}", re.DOTALL)      # đa-run
-BOLD_RE        = re.compile(r"\*\*(.*?)\*\*")             # **bold**
-TOKEN_RE       = re.compile(r"\{\{([^{}]+)\}\}")          # {{Key}}
+# =========================
+# UTILITIES: WORD/Paragraph
+# =========================
 
 def _is_md_table(text: str) -> bool:
     lines = [l.strip() for l in (text or "").strip().splitlines() if l.strip()]
@@ -50,15 +80,16 @@ def _is_md_table(text: str) -> bool:
         and set(lines[1].replace(" ", "").replace(":", "")) <= set("-|")
     )
 
-def _parse_md_table(text: str):
+
+def _parse_md_table(text: str) -> Tuple[List[str], List[List[str]]]:
     lines  = [l.strip() for l in (text or "").strip().splitlines() if l.strip()]
     header = [c.strip() for c in lines[0].split("|")]
     if header and header[0] == "":
         header = header[1:]
     if header and header[-1] == "":
         header = header[:-1]
-    rows   = []
-    for ln in lines[2:]:
+    rows: List[List[str]] = []
+    for ln in lines[2:]:  # Skip header + separator
         cols = [c.strip() for c in ln.split("|")]
         if cols and cols[0] == "":
             cols = cols[1:]
@@ -72,7 +103,8 @@ def _parse_md_table(text: str):
             rows.append(cols)
     return header, rows
 
-def _insert_paragraph_after(anchor_para: Paragraph, style=None) -> Paragraph:
+
+def _insert_paragraph_after(anchor_para: Paragraph, style: Optional[str] = None) -> Paragraph:
     new_p_ox = OxmlElement("w:p")
     anchor_para._p.addnext(new_p_ox)
     new_para = Paragraph(new_p_ox, anchor_para._parent)
@@ -83,7 +115,8 @@ def _insert_paragraph_after(anchor_para: Paragraph, style=None) -> Paragraph:
             pass
     return new_para
 
-def add_formatted_text(paragraph: Paragraph, text: str, style_info=None):
+
+def add_formatted_text(paragraph: Paragraph, text: str, style_info: Optional[dict] = None) -> None:
     parts   = BOLD_RE.split(text or "")
     is_bold = False
     for part in parts:
@@ -113,7 +146,8 @@ def add_formatted_text(paragraph: Paragraph, text: str, style_info=None):
             run.bold = run.bold or is_bold
         is_bold = not is_bold
 
-def _concat_runs(paragraph: Paragraph):
+
+def _concat_runs(paragraph: Paragraph) -> Tuple[str, List[Tuple]]:
     meta, pos, buf = [], 0, []
     for r in paragraph.runs:
         t = r.text or ""
@@ -123,7 +157,8 @@ def _concat_runs(paragraph: Paragraph):
         pos = end
     return "".join(buf), meta
 
-def _insert_table_after(paragraph: Paragraph, header, rows, table_style="New Table"):
+
+def _insert_table_after(paragraph: Paragraph, header: List[str], rows: List[List[str]], table_style: str = "New Table") -> None:
     if not header or not rows:
         return
     body = paragraph._parent
@@ -145,8 +180,14 @@ def _insert_table_after(paragraph: Paragraph, header, rows, table_style="New Tab
                 pass
     paragraph._p.addnext(tbl._tbl)
 
+
+# =========================
+# WORD TEMPLATE PROCESSING
+# =========================
+
 def extract_vars_and_desc(docx_file_or_buffer) -> Dict[str, str]:
-    xml_parts = []
+    """Trích xuất {placeholder: mô tả} từ .docx (body/header/footer)."""
+    xml_parts: List[str] = []
     with zipfile.ZipFile(docx_file_or_buffer) as z:
         for name in z.namelist():
             if name.startswith("word/") and name.endswith(".xml"):
@@ -157,10 +198,10 @@ def extract_vars_and_desc(docx_file_or_buffer) -> Dict[str, str]:
     pattern = re.compile(r"\{\{\s*([A-Za-z0-9_]+)\s*\}\}\s*\{#\s*(.*?)\s*#\}", flags=re.DOTALL)
     return dict(pattern.findall(full_text))
 
-def replace_in_paragraph(paragraph: Paragraph, data: Dict[str, str]):
+
+def replace_in_paragraph(paragraph: Paragraph, data: Dict[str, str]) -> None:
     if not paragraph.runs:
         return
-
     full_text, meta = _concat_runs(paragraph)
     if not full_text:
         return
@@ -181,8 +222,8 @@ def replace_in_paragraph(paragraph: Paragraph, data: Dict[str, str]):
 
     items.sort(key=lambda x: x[1], reverse=True)
 
-    bullet_queue = []
-    table_queue  = []
+    bullet_queue: List[Tuple[str, str]] = []  # (text, style)
+    table_queue:  List[Tuple[List[str], List[List[str]]]] = []
 
     for item_type, start, end, key in items:
         run_start_idx = next((i for i, (_, s, e) in enumerate(meta) if s <= start < e), None)
@@ -206,6 +247,7 @@ def replace_in_paragraph(paragraph: Paragraph, data: Dict[str, str]):
                 run_end.text = (run_end.text or "")[offset_end:]
             continue
 
+        # token {{key}}
         value = data.get(key, "")
 
         if isinstance(value, str) and _is_md_table(value):
@@ -263,7 +305,8 @@ def replace_in_paragraph(paragraph: Paragraph, data: Dict[str, str]):
             except Exception as e:
                 print(f"Error inserting table: {e}")
 
-def fill_template_to_buffer(template_file_or_path, data_input: Dict[str, str]):
+
+def fill_template_to_buffer(template_file_or_path, data_input: Dict[str, str]) -> Optional[io.BytesIO]:
     try:
         doc = Document(template_file_or_path)
     except Exception as e:
@@ -308,86 +351,179 @@ def fill_template_to_buffer(template_file_or_path, data_input: Dict[str, str]):
         st.error(f"Đã xảy ra lỗi khi tạo file Word: {e}")
         return None
 
-# ---------- NEW: đọc CSV attendance thành text an toàn ----------
-def read_uploaded_csv_as_text(uploaded_file, max_rows=1000, max_chars=200_000):
-    """
-    Đọc file CSV đã upload và trả về chuỗi CSV (tối đa max_rows dòng, tối đa max_chars ký tự).
-    """
-    if uploaded_file is None:
+
+# =========================
+# CSV PARSER: THÀNH VIÊN
+# =========================
+
+def _normalize(s: str) -> str:
+    if not isinstance(s, str):
         return ""
-    raw = uploaded_file.getvalue()
-    try:
-        text = raw.decode("utf-8-sig")
-    except Exception:
-        text = raw.decode("latin-1", errors="ignore")
+    s2 = s.strip().lower()
+    # bỏ dấu tiếng Việt đơn giản
+    rep = {
+        "à": "a", "á": "a", "ả": "a", "ã": "a", "ạ": "a",
+        "ă": "a", "ằ": "a", "ắ": "a", "ẳ": "a", "ẵ": "a", "ặ": "a",
+        "â": "a", "ầ": "a", "ấ": "a", "ẩ": "a", "ẫ": "a", "ậ": "a",
+        "è": "e", "é": "e", "ẻ": "e", "ẽ": "e", "ẹ": "e",
+        "ê": "e", "ề": "e", "ế": "e", "ể": "e", "ễ": "e", "ệ": "e",
+        "ì": "i", "í": "i", "ỉ": "i", "ĩ": "i", "ị": "i",
+        "ò": "o", "ó": "o", "ỏ": "o", "õ": "o", "ọ": "o",
+        "ô": "o", "ồ": "o", "ố": "o", "ổ": "o", "ỗ": "o", "ộ": "o",
+        "ơ": "o", "ờ": "o", "ớ": "o", "ở": "o", "ỡ": "o", "ợ": "o",
+        "ù": "u", "ú": "u", "ủ": "u", "ũ": "u", "ụ": "u",
+        "ư": "u", "ừ": "u", "ứ": "u", "ử": "u", "ữ": "u", "ự": "u",
+        "ỳ": "y", "ý": "y", "ỷ": "y", "ỹ": "y", "ỵ": "y",
+        "đ": "d",
+    }
+    for a, b in rep.items():
+        s2 = s2.replace(a, b)
+    return s2
 
-    reader = csv.reader(io.StringIO(text))
+
+def _first_match(cols: List[str], candidates: List[str]) -> Optional[str]:
+    cols_norm = {c: _normalize(c) for c in cols}
+    for c in candidates:
+        for col, norm in cols_norm.items():
+            if c in norm:
+                return col
+    return None
+
+
+def _looks_present(val) -> bool:
+    if val is None:
+        return True  # nếu không có cột thì mặc định có mặt
+    s = str(val).strip().lower()
+    return s in {"1", "x", "✓", "yes", "y", "true", "present", "co", "có", "tham du", "attended"}
+
+
+def parse_attendance_csv(file) -> Dict[str, str]:
+    """Đọc CSV và trả về:
+    {
+      'participants_bullets': "+ Name — Chức vụ, Đơn vị (email)\n+ ...",
+      'participants_table_md': "|Name|Title|Dept|Email|\n|---|---|---|---|\n|...|...|...|...|"
+    }
+    """
+    df = pd.read_csv(file)
+    if df.empty:
+        return {"participants_bullets": "", "participants_table_md": ""}
+
+    cols = list(df.columns)
+    name_col = _first_match(cols, ["name", "full name", "fullname", "ho va ten", "ho ten", "ten", "hova ten", "ho-va-ten", "hvt", "họ và tên"])
+    dept_col = _first_match(cols, ["don vi", "phong ban", "department", "unit", "division"])
+    title_col= _first_match(cols, ["chuc vu", "title", "position", "role"])
+    mail_col = _first_match(cols, ["email", "mail"])
+    att_col  = _first_match(cols, ["attendance", "status", "co mat", "tham du", "present", "attended"])
+
+    # Lọc hàng có mặt (nếu có cột attendance)
+    if att_col:
+        df = df[df[att_col].apply(_looks_present)]
+
+    # Tạo bullets cấp 2 theo yêu cầu template VPI
+    bullet_lines: List[str] = []
+    for _, r in df.iterrows():
+        parts = []
+        name = str(r.get(name_col, "")).strip()
+        if name:
+            parts.append(name)
+        title = str(r.get(title_col, "")).strip()
+        dept  = str(r.get(dept_col,  "")).strip()
+        email = str(r.get(mail_col,  "")).strip()
+        tail_bits = []
+        if title:
+            tail_bits.append(title)
+        if dept:
+            tail_bits.append(dept)
+        tail = ", ".join(tail_bits)
+        shown = name
+        if tail:
+            shown += f" — {tail}"
+        if email:
+            shown += f" ({email})"
+        if shown:
+            bullet_lines.append(f"+ {shown}")
+
+    participants_bullets = "\n".join(bullet_lines)
+
+    # Tạo bảng markdown (dùng các cột còn lại nếu có)
+    headers = []
     rows = []
-    for idx, row in enumerate(reader):
-        if idx >= max_rows:
-            break
-        rows.append(row)
+    def add_hdr(h):
+        if h not in headers:
+            headers.append(h)
 
-    output = io.StringIO()
-    writer = csv.writer(output)
-    for r in rows:
-        writer.writerow(r)
-    csv_text = output.getvalue()
+    if name_col: add_hdr("Name")
+    if title_col: add_hdr("Title/Position")
+    if dept_col: add_hdr("Department")
+    if mail_col: add_hdr("Email")
 
-    if len(csv_text) > max_chars:
-        csv_text = csv_text[:max_chars] + "\n...[TRUNCATED]"
-    return csv_text
+    if headers:
+        for _, r in df.iterrows():
+            row = []
+            if name_col: row.append(str(r.get(name_col, "")).strip())
+            if title_col: row.append(str(r.get(title_col, "")).strip())
+            if dept_col: row.append(str(r.get(dept_col, "")).strip())
+            if mail_col: row.append(str(r.get(mail_col, "")).strip())
+            rows.append(row)
+        # markdown table
+        sep = "|" + "|".join(["---" for _ in headers]) + "|"
+        participants_table_md = "|" + "|".join(headers) + "|\n" + sep + "\n" + "\n".join(["|" + "|".join(r) + "|" for r in rows])
+    else:
+        participants_table_md = ""
 
-# ---------- CHANGED: gộp transcript + CSV khi gọi AI ----------
-def call_gemini_model(transcript_content, csv_text, placeholders):
-    """Gửi yêu cầu đến Gemini và nhận về kết quả JSON (đã gộp transcript + CSV)."""
+    return {
+        "participants_bullets": participants_bullets,
+        "participants_table_md": participants_table_md,
+    }
+
+
+# =========================
+# LLM CALL (Gemini)
+# =========================
+
+def call_gemini_model(transcript_content: str, placeholders: Dict[str, str], participants_hint: Dict[str, str] | None = None) -> Optional[Dict[str, str]]:
     model = genai.GenerativeModel("gemini-2.5-pro")
-    Prompt_word = """
+
+    # Chuẩn bị phần dữ liệu CSV cho prompt
+    participants_block = ""
+    if participants_hint:
+        blt = participants_hint.get("participants_bullets", "").strip()
+        tbl = participants_hint.get("participants_table_md", "").strip()
+        participants_block = f"""
+# Dữ liệu CSV thành viên (ưu tiên sử dụng khi điền các trường liên quan người tham dự)
+- **Bullet cấp 2 (ưu tiên cho {{ThanhPhanThamGia}} nếu có trong placeholders):**\n{blt}
+- **Bảng Markdown (nếu cần):**\n{tbl}
+""".strip()
+
+    # Prompt (kế thừa & mở rộng từ app gốc)
+    Prompt_word = f"""
 # Vai trò
-Bạn là một trợ lý AI chuyên nghiệp, có nhiệm vụ trích xuất thông tin quan trọng từ tư liệu cuộc họp (transcript + dữ liệu attendance CSV) để tạo nội dung cho biên bản, đảm bảo tính chính xác và trình bày chuyên nghiệp.
+Bạn là trợ lý AI chuyên nghiệp, nhiệm vụ: trích xuất/thể hiện nội dung cho biên bản cuộc họp từ transcript **và** dữ liệu CSV người tham dự (nếu có), đảm bảo chính xác và trình bày chuẩn mực.
 
 # Đầu vào
-1.  **Bản ghi cuộc họp (transcript):**
-{0}
+1) **Bản ghi cuộc họp (transcript):** ```{transcript_content}```
+2) **Danh sách placeholders cần điền** (dict: key = tên trường, value = mô tả/định dạng yêu cầu): ```{json.dumps(placeholders, ensure_ascii=False)}```
+3) **Dữ liệu CSV về thành viên** (nếu có):
+{participants_block}
 
-1b. **Dữ liệu attendance dạng CSV** (ví dụ từ Google Meet/Teams; có thể gồm tên người tham gia, giờ vào/ra, thời lượng, email, v.v.):
-```csv
-{1}
-```
+# Yêu cầu quan trọng
+- **Luôn trả về tiếng Việt**.
+- **Chỉ trả về đúng một đối tượng JSON**: keys **trùng 100%** tên placeholders; values **chỉ là chuỗi** (string). **Không** thêm/bớt key, không lồng cấu trúc.
+- **Tuân thủ chặt chẽ định dạng** ghi trong mô tả của từng placeholder (bullet 1: bắt đầu bằng "- ", bullet 2: bắt đầu bằng "+ ", bảng: Markdown...).
+- **Ưu tiên sử dụng dữ liệu CSV** để điền các trường về **thành phần tham gia**, **vai trò/phụ trách**. Nếu transcript cũng có thông tin, **kết hợp hợp lý**.
+- Nếu thiếu thông tin: ghi đúng chuỗi **"Chưa có thông tin"**.
 
-2.  **Danh sách các trường thông tin cần trích xuất (placeholders):**
-{2}
-(Là một đối tượng/dictionary nơi mỗi key là tên trường cần trích xuất và value là mô tả/yêu cầu định dạng.)
+# Kết quả
+- Xuất **một chuỗi JSON hợp lệ duy nhất** theo đúng quy tắc trên.
+"""
 
-# Nhiệm vụ
-1) Đọc & hiểu toàn bộ transcript **và** CSV attendance.
-2) Với **từng** key trong `placeholders`:
-   - Tìm thông tin tương ứng từ transcript/CSV (ưu tiên dữ liệu định lượng như danh sách người tham dự, thời lượng… từ CSV nếu có).
-   - Trích xuất **đầy đủ, chính xác**; nếu không có thông tin, ghi đúng: `Chưa có thông tin`.
-3) **Định dạng & Diễn đạt**:
-   - **Luôn trả về bằng tiếng Việt**; văn phong trang trọng, mạch lạc, đúng chuẩn văn bản biên bản.
-   - **Tuân thủ định dạng** yêu cầu trong *value mô tả* của từng placeholder (bullet 1 `- `, bullet 2 `+ `, bảng Markdown, đoạn văn…).
-4) **Trả về đúng 1 đối tượng JSON** tuân thủ chặt chẽ quy tắc sau.
-
-# Quy tắc xuất kết quả (TUÂN THỦ NGHIÊM NGẶT)
-- **Keys**: trùng 100% với các key trong `placeholders` (giữ nguyên ký tự).
-- **Chỉ** xuất các cặp key-value tương ứng, **không** thêm/bớt/lồng khác.
-- **Values**:
-  - **Bắt buộc** đúng định dạng theo mô tả placeholder (bullet, bảng Markdown, đoạn…).
-  - Mọi value đều là **chuỗi (string)**.
-  - Nếu thiếu dữ liệu: giá trị là chuỗi **`Chưa có thông tin`**.
-
-(Lưu ý: Nếu có mâu thuẫn giữa transcript và CSV, ghi nhận theo CSV cho các dữ liệu tham dự/giờ/định lượng; nội dung thảo luận/ý kiến giữ theo transcript.)
-    """
-    prompt = Prompt_word.format(transcript_content, csv_text, placeholders)
     try:
         response = model.generate_content(
-            contents=prompt,
+            contents=Prompt_word,
             generation_config={"response_mime_type": "application/json"}
         )
         if response and hasattr(response, "text"):
             raw = response.text.strip()
-            # Một số model bọc JSON trong ```json ... ```
             if raw.startswith("```"):
                 raw = raw.split("```")[1].strip("json\n")
             return json.loads(raw)
@@ -398,22 +534,29 @@ Bạn là một trợ lý AI chuyên nghiệp, có nhiệm vụ trích xuất th
         st.error(f"Lỗi khi gọi Gemini API: {e}")
         return None
 
-def send_email_with_attachment(recipient_email, attachment_buffer, filename="BBCH.docx"):
+
+# =========================
+# EMAIL SENDER
+# =========================
+
+def send_email_with_attachment(recipient_email: str, attachment_buffer: io.BytesIO, filename: str = "Bien_ban_cuoc_hop.docx") -> bool:
     SMTP_SERVER = "smtp.office365.com"
     SMTP_PORT = 587
+
+    from email.message import EmailMessage
 
     msg = EmailMessage()
     msg["Subject"] = "Biên bản cuộc họp đã được tạo tự động"
     msg["From"] = APP_EMAIL
     msg["To"] = recipient_email
     msg.set_content(
-        "Chào bạn,\\n\\nBiên bản cuộc họp đã được tạo thành công.\\nVui lòng xem trong file đính kèm.\\n\\nTrân trọng,\\nCông cụ tạo biên bản tự động."
+        "Chào bạn,\n\nBiên bản cuộc họp đã được tạo thành công.\nVui lòng xem trong file đính kèm.\n\nTrân trọng,\nCông cụ tạo biên bản tự động."
     )
     msg.add_attachment(
         attachment_buffer.getvalue(),
         maintype="application",
         subtype="vnd.openxmlformats-officedocument.wordprocessingml.document",
-        filename=filename
+        filename=filename,
     )
 
     try:
@@ -427,56 +570,66 @@ def send_email_with_attachment(recipient_email, attachment_buffer, filename="BBC
         st.error(f"Lỗi khi gửi email: {e}. Vui lòng kiểm tra lại cấu hình email và mật khẩu ứng dụng.")
         return False
 
-#======================================================================
-# PHẦN 2: GIAO DIỆN STREAMLIT
-#======================================================================
 
-st.set_page_config(layout="wide", page_title="Công cụ tạo Biên bản cuộc họp")
-st.title("🛠️ Công cụ tạo biên bản cuộc họp tự động")
+# =========================
+# HELPERS (IO/UI)
+# =========================
+
+def load_transcript_docx(file) -> str:
+    """Đọc toàn bộ text từ .docx transcript."""
+    try:
+        doc = Document(file)
+        return "\n".join([para.text for para in doc.paragraphs])
+    except Exception as e:
+        st.error(f"Lỗi đọc transcript .docx: {e}")
+        return ""
+
+
+def ensure_template_path(default_filename: str) -> Optional[str]:
+    """Trả template path nếu tồn tại, ngược lại cảnh báo người dùng chọn custom."""
+    if os.path.exists(default_filename):
+        return default_filename
+    st.error(f"Không tìm thấy template mặc định: {default_filename}. Hãy chọn 'Template tùy chỉnh' và tải file lên.")
+    return None
+
+
+# =========================
+# STREAMLIT UI
+# =========================
+
+st.set_page_config(layout="wide", page_title="Công cụ tạo Biên bản cuộc họp (refactor)")
+st.title("🛠️ Công cụ tạo biên bản cuộc họp tự động — Bản refactor")
 
 with st.sidebar:
-    st.info("📝 Hướng dẫn sử dụng")
-    st.markdown("""
-1. Tải file transcript: Tải lên file `.docx` chứa nội dung cuộc họp.
-2. Tải file attendance: Tải lên file `.csv` điểm danh (tham dự).
-3. Chọn Template:
-   * Sử dụng mẫu có sẵn bằng cách chọn **Template VPI**.
-   * Hoặc **Template tùy chỉnh** và tải file của bạn lên.
-4. Điền thông tin: Nhập các thông tin cơ bản của cuộc họp.
-5. Nhập email: Điền địa chỉ email bạn muốn nhận kết quả.
-6. Chạy: Nhấn nút **Tạo biên bản**.
-    """)
-    st.info("📝 **Hướng dẫn tạo template**")
-    st.markdown("""
-📂 File nhận đầu vào là file `.docx`  
-Khi tạo template cho biên bản cuộc họp, bạn cần mô tả rõ từng biến để hệ thống hiểu đúng và điền thông tin chính xác:
+    st.info("**Hướng dẫn nhanh**")
+    st.markdown(
+        """
+1) Tải **transcript (.docx)** và **CSV thành viên**
+2) Chọn **Template VPI** hoặc **Template tùy chỉnh (.docx)**
+3) Điền vài trường tay (nếu muốn)
+4) Nhấn **Tạo biên bản**
+        """
+    )
+    st.caption("Yêu cầu thư viện đã có trong requirements.txt của dự án.")
 
-`{{Ten_bien}}{# Mo_ta_chi_tiet #}`
+st.subheader("1) Nhập dữ liệu đầu vào")
+colA, colB = st.columns(2)
+with colA:
+    transcript_file = st.file_uploader("Tải transcript (.docx)", type=["docx"], key="transcript")
+with colB:
+    csv_file = st.file_uploader("Tải CSV thành viên (Attendance)", type=["csv"], key="csv")
 
-- `{{Ten_bien}}`: tiếng Việt không dấu/tiếng Anh, **không** dấu cách (dùng `_` nếu cần).
-- `{# Mo_ta_chi_tiet #}`: mô tả **thông tin cần điền** và **yêu cầu định dạng** (bullet 1 `- `, bullet 2 `+ `, bảng Markdown, đoạn văn...). Chỉ dùng **hai cấp bullet**.
-- Tạo style cho bullet/bảng trong Word: `List Bullet`, `List Bullet 2`, bảng `New Table`.
-    """)
-    st.markdown("---")
-    st.success("Ứng dụng được phát triển bởi VPI.")
-
-st.subheader("1. Nhập thông tin đầu vào")
-transcript_file = st.file_uploader("1a) Tải lên file transcript (.docx) – *BẮT BUỘC*", type=["docx"])
-csv_file        = st.file_uploader("1b) Tải lên file attendance (.csv) – *BẮT BUỘC*", type=["csv"])
-
-st.subheader("2. Lựa chọn Template")
+st.subheader("2) Lựa chọn Template")
 template_option = st.selectbox(
     "Bạn muốn sử dụng loại template nào?",
     ("Template VPI", "Template tùy chỉnh"),
-    help="Chọn 'Template VPI' để dùng mẫu có sẵn hoặc 'Template tùy chỉnh' để tải lên file của riêng bạn."
 )
+
 template_file = None
 if template_option == "Template tùy chỉnh":
-    template_file = st.file_uploader("Tải lên file template .docx của bạn", type=["docx"])
-else:
-    st.caption("Các trường bắt buộc đã có sẵn trong Template VPI.")
+    template_file = st.file_uploader("Tải file template .docx của bạn", type=["docx"], key="tpl")
 
-st.subheader("3. Thông tin cơ bản (BẮT BUỘC)")
+st.subheader("3) Thông tin cơ bản (ghi đè kết quả AI nếu nhập)")
 col1, col2 = st.columns(2)
 with col1:
     meeting_name      = st.text_input("Tên cuộc họp")
@@ -486,86 +639,77 @@ with col2:
     meeting_chair     = st.text_input("Tên chủ trì")
     meeting_secretary = st.text_input("Tên thư ký")
 
-recipient_email = st.text_input("4. Email nhận kết quả của bạn (BẮT BUỘC)")
+recipient_email = st.text_input("4) Email nhận kết quả (tùy chọn)")
 
 if st.button("🚀 Tạo biên bản", type="primary"):
-    # Kiểm tra bắt buộc mọi thứ
-    required_fields = {
-        "Transcript (.docx)": transcript_file,
-        "Attendance CSV (.csv)": csv_file,
-        "Tên cuộc họp": (meeting_name or "").strip(),
-        "Thời gian cuộc họp": (meeting_time or "").strip(),
-        "Địa điểm cuộc họp": (meeting_location or "").strip(),
-        "Tên chủ trì": (meeting_chair or "").strip(),
-        "Tên thư ký": (meeting_secretary or "").strip(),
-        "Email nhận kết quả": (recipient_email or "").strip(),
-    }
-    missing = [label for label, val in required_fields.items() if not val]
-    if missing:
-        st.error("❌ Thiếu thông tin bắt buộc: " + ", ".join(missing))
-        st.stop()
-
-    # Xác định template
-    template_to_use = None
-    if template_option == "Template VPI":
-        default_path = "2025.VPI_BB hop 2025 1.docx"
-        if not os.path.exists(default_path):
-            st.error(f"Không tìm thấy template mặc định: {default_path}. Hãy chọn 'Template tùy chỉnh' và tải file lên.")
-            st.stop()
-        else:
-            template_to_use = default_path
-    elif template_file is not None:
-        template_to_use = template_file
+    if not transcript_file:
+        st.warning("Vui lòng tải lên file transcript .docx")
     else:
-        st.error("Bạn đã chọn 'Template tùy chỉnh' nhưng chưa tải file template.")
-        st.stop()
+        # 1) Chọn template
+        template_to_use = None
+        if template_option == "Template VPI":
+            # Giữ tên template mặc định y như repo gốc để tương thích
+            default_path = "2025.VPI_BB hop 2025 1.docx"
+            template_to_use = ensure_template_path(default_path)
+        else:
+            template_to_use = template_file
 
-    # Qua được đây => đủ điều kiện
-    with st.spinner("⏳ Hệ thống đang xử lý..."):
-        try:
-            st.info("1/4 - Đang đọc và phân tích transcript (.docx)...")
-            doc = Document(transcript_file)
-            transcript_content = "\n".join([para.text for para in doc.paragraphs])
+        if not template_to_use:
+            st.stop()
 
-            st.info("1b/4 - Đang đọc attendance (.csv)...")
-            csv_text = read_uploaded_csv_as_text(csv_file, max_rows=2000, max_chars=300_000)
-            if "...[TRUNCATED]" in csv_text:
-                st.warning("⚠️ Attendance CSV lớn — đã rút gọn an toàn cho AI. Nên lọc cột/dòng trước khi upload để tăng độ chính xác.")
+        with st.spinner("⏳ Đang xử lý..."):
+            try:
+                st.info("1/5 - Đọc transcript .docx")
+                transcript_content = load_transcript_docx(transcript_file)
 
-            st.info("2/4 - Đang trích placeholders từ template...")
-            placeholders = extract_vars_and_desc(template_to_use)
+                st.info("2/5 - Trích placeholders từ template")
+                placeholders = extract_vars_and_desc(template_to_use)
 
-            st.info("3/4 - Đang gọi AI để trích xuất nội dung (gộp transcript + CSV)...")
-            llm_result = call_gemini_model(transcript_content, csv_text, placeholders)
+                st.info("3/5 - Phân tích CSV thành viên")
+                participants_hint = {"participants_bullets": "", "participants_table_md": ""}
+                if csv_file is not None:
+                    try:
+                        participants_hint = parse_attendance_csv(csv_file)
+                    except Exception as e:
+                        st.warning(f"Không đọc được CSV: {e}")
 
-            if llm_result is None:
-                st.error("Không thể lấy kết quả từ AI. Vui lòng thử lại.")
-                st.stop()
+                st.info("4/5 - Gọi AI tạo JSON theo placeholders (kết hợp transcript + CSV)")
+                llm_result = call_gemini_model(transcript_content, placeholders, participants_hint)
 
-            # Ghi đè bằng input tay (bắt buộc)
-            manual_inputs = {
-                'TenCuocHop':        meeting_name,
-                'ThoiGianCuocHop':   meeting_time,
-                'DiaDiemCuocHop':    meeting_location,
-                'TenChuTri':         meeting_chair,
-                'TenThuKy':          meeting_secretary
-            }
-            llm_result.update(manual_inputs)
+                if llm_result:
+                    # Ghi đè các input tay (nếu nhập)
+                    manual_inputs = {
+                        'TenCuocHop':       meeting_name,
+                        'ThoiGianCuocHop':  meeting_time,
+                        'DiaDiemCuocHop':   meeting_location,
+                        'TenChuTri':        meeting_chair,
+                        'TenThuKy':         meeting_secretary,
+                    }
+                    for k, v in manual_inputs.items():
+                        if v and k in llm_result:
+                            llm_result[k] = v
 
-            st.info("4/4 - Đang tạo file biên bản Word...")
-            docx_buffer = fill_template_to_buffer(template_to_use, llm_result)
-            if docx_buffer:
-                st.success("✅ Tạo biên bản thành công!")
-                st.download_button(
-                    "⬇️ Tải về biên bản",
-                    data=docx_buffer,
-                    file_name="Bienbancuochop.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                )
-                if recipient_email:
-                    if send_email_with_attachment(recipient_email, docx_buffer, filename="Bien_ban_cuoc_hop.docx"):
-                        st.success("✉️ Đã gửi biên bản tới email của bạn.")
-            else:
-                st.error("Không thể tạo file Word. Vui lòng kiểm tra lại file template.")
-        except Exception as e:
-            st.error(f"Đã xảy ra lỗi: {e}")
+                    # Ưu tiên CSV cho thành phần tham gia nếu placeholder tồn tại
+                    if 'ThanhPhanThamGia' in llm_result and participants_hint.get("participants_bullets"):
+                        llm_result['ThanhPhanThamGia'] = participants_hint['participants_bullets']
+
+                    st.info("5/5 - Điền template và tạo file Word")
+                    docx_buffer = fill_template_to_buffer(template_to_use, llm_result)
+                    if docx_buffer:
+                        st.success("✅ Tạo biên bản thành công!")
+                        st.download_button(
+                            "⬇️ Tải về biên bản",
+                            data=docx_buffer,
+                            file_name="Bien_ban_cuoc_hop.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        )
+                        if recipient_email:
+                            ok = send_email_with_attachment(recipient_email, docx_buffer)
+                            if ok:
+                                st.success("✉️ Đã gửi biên bản tới email của bạn.")
+                    else:
+                        st.error("Không thể tạo file Word. Kiểm tra lại template hoặc dữ liệu đầu vào.")
+                else:
+                    st.error("AI không trả về kết quả hợp lệ. Vui lòng thử lại.")
+            except Exception as e:
+                st.error(f"Đã xảy ra lỗi: {e}")
