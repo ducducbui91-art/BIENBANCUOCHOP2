@@ -562,8 +562,7 @@ def _attendance_df_to_struct(df: pd.DataFrame) -> Dict[str, str]:
         if shown:
             bullet_lines.append(f"+ {shown}")
 
-    participants_bullets = "
-".join(bullet_lines)
+    participants_bullets = "".join(bullet_lines)
 
     headers = []
     rows = []
