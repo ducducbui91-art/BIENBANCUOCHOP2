@@ -770,7 +770,6 @@ if st.button("🚀 Tạo biên bản", type="primary"):
         # 1) Chọn template
         template_to_use = None
         if template_option == "Template VPI":
-            # Giữ tên template mặc định y như repo gốc để tương thích
             default_path = "2025.VPI_BB hop 2025 1.docx"
             template_to_use = ensure_template_path(default_path)
         else:
@@ -787,14 +786,13 @@ if st.button("🚀 Tạo biên bản", type="primary"):
                 st.info("2/5 - Trích placeholders từ template")
                 placeholders = extract_vars_and_desc(template_to_use)
 
-                st.info("3/5 - Phân tích CSV thành viên")
+                st.info("3/5 - Phân tích CSV/Excel thành viên")
                 participants_hint = {"participants_bullets": "", "participants_table_md": ""}
-
-    if csv_file is not None:
-        try:
-            participants_hint = parse_attendance_any(csv_file)
-        except Exception as e:
-            st.warning(f"Không đọc được CSV/Excel: {e}")
+                if csv_file is not None:
+                    try:
+                        participants_hint = parse_attendance_any(csv_file)
+                    except Exception as e:
+                        st.warning(f"Không đọc được CSV/Excel: {e}")
 
                 st.info("4/5 - Gọi AI tạo JSON theo placeholders (kết hợp transcript + CSV)")
                 llm_result = call_gemini_model(transcript_content, placeholders, participants_hint)
