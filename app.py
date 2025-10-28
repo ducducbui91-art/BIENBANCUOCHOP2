@@ -478,6 +478,132 @@ def parse_attendance_csv(file) -> Dict[str, str]:
 
 
 # =========================
+# HỖ TRỢ ĐỌC CSV/XLSX
+# =========================
+
+def read_attendance_to_df(file) -> pd.DataFrame:
+    """Cố gắng đọc file attendance dưới dạng Excel hoặc CSV.
+    - Ưu tiên detect theo phần mở rộng file.name
+    - Nếu là CSV: thử nhiều encoding.
+    """
+    name = getattr(file, "name", "") or ""
+    ext = os.path.splitext(name.lower())[1]
+
+    # Nếu là Excel
+    if ext in (".xlsx", ".xls"):
+        try:
+            return pd.read_excel(file)
+        except Exception:
+            # Nếu đọc Excel thất bại, thử quay lại đầu và đọc dạng CSV (edge case export sai MIME)
+            try:
+                file.seek(0)
+            except Exception:
+                pass
+
+    # Thử đọc CSV với nhiều encoding
+    encodings = ["utf-8", "utf-8-sig", "cp1258", "latin1"]
+    last_err = None
+    for enc in encodings:
+        try:
+            file.seek(0)
+        except Exception:
+            pass
+        try:
+            return pd.read_csv(file, encoding=enc)
+        except Exception as e:
+            last_err = e
+            continue
+
+    # Thử chốt: nếu là Excel thật sự nhưng không có phần mở rộng
+    try:
+        file.seek(0)
+    except Exception:
+        pass
+    try:
+        return pd.read_excel(file)
+    except Exception as e:
+        raise RuntimeError(f"Không thể đọc file Attendance (CSV/Excel). Lỗi cuối: {last_err or e}")
+
+
+def _attendance_df_to_struct(df: pd.DataFrame) -> Dict[str, str]:
+    if df is None or df.empty:
+        return {"participants_bullets": "", "participants_table_md": ""}
+
+    cols = list(df.columns)
+    name_col = _first_match(cols, ["name", "full name", "fullname", "ho va ten", "ho ten", "ten", "hova ten", "ho-va-ten", "hvt", "họ và tên"])
+    dept_col = _first_match(cols, ["don vi", "phong ban", "department", "unit", "division"])
+    title_col= _first_match(cols, ["chuc vu", "title", "position", "role"])
+    mail_col = _first_match(cols, ["email", "mail"])
+    att_col  = _first_match(cols, ["attendance", "status", "co mat", "tham du", "present", "attended"])
+
+    if att_col:
+        df = df[df[att_col].apply(_looks_present)]
+
+    bullet_lines: List[str] = []
+    for _, r in df.iterrows():
+        parts = []
+        name = str(r.get(name_col, "")).strip()
+        if name:
+            parts.append(name)
+        title = str(r.get(title_col, "")).strip()
+        dept  = str(r.get(dept_col,  "")).strip()
+        email = str(r.get(mail_col,  "")).strip()
+        tail_bits = []
+        if title:
+            tail_bits.append(title)
+        if dept:
+            tail_bits.append(dept)
+        tail = ", ".join(tail_bits)
+        shown = name
+        if tail:
+            shown += f" — {tail}"
+        if email:
+            shown += f" ({email})"
+        if shown:
+            bullet_lines.append(f"+ {shown}")
+
+    participants_bullets = "
+".join(bullet_lines)
+
+    headers = []
+    rows = []
+    def add_hdr(h):
+        if h not in headers:
+            headers.append(h)
+
+    if name_col: add_hdr("Name")
+    if title_col: add_hdr("Title/Position")
+    if dept_col: add_hdr("Department")
+    if mail_col: add_hdr("Email")
+
+    if headers:
+        for _, r in df.iterrows():
+            row = []
+            if name_col: row.append(str(r.get(name_col, "")).strip())
+            if title_col: row.append(str(r.get(title_col, "")).strip())
+            if dept_col: row.append(str(r.get(dept_col, "")).strip())
+            if mail_col: row.append(str(r.get(mail_col, "")).strip())
+            rows.append(row)
+        sep = "|" + "|".join(["---" for _ in headers]) + "|"
+        participants_table_md = "|" + "|".join(headers) + "|
+" + sep + "
+" + "
+".join(["|" + "|".join(r) + "|" for r in rows])
+    else:
+        participants_table_md = ""
+
+    return {
+        "participants_bullets": participants_bullets,
+        "participants_table_md": participants_table_md,
+    }
+
+
+def parse_attendance_any(file) -> Dict[str, str]:
+    """API hợp nhất: nhận file CSV/XLSX và trả về cấu trúc bullets + bảng markdown."""
+    df = read_attendance_to_df(file)
+    return _attendance_df_to_struct(df)
+
+# =========================
 # LLM CALL (Gemini)
 # =========================
 
@@ -617,7 +743,7 @@ colA, colB = st.columns(2)
 with colA:
     transcript_file = st.file_uploader("Tải transcript (.docx)", type=["docx"], key="transcript")
 with colB:
-    csv_file = st.file_uploader("Tải CSV thành viên (Attendance)", type=["csv"], key="csv")
+    csv_file = st.file_uploader("Tải CSV/Excel thành viên (Attendance)", type=["csv", "xlsx", "xls"], key="csv")
 
 st.subheader("2) Lựa chọn Template")
 template_option = st.selectbox(
@@ -667,11 +793,11 @@ if st.button("🚀 Tạo biên bản", type="primary"):
 
                 st.info("3/5 - Phân tích CSV thành viên")
                 participants_hint = {"participants_bullets": "", "participants_table_md": ""}
-                if csv_file is not None:
-                    try:
-                        participants_hint = parse_attendance_csv(csv_file)
-                    except Exception as e:
-                        st.warning(f"Không đọc được CSV: {e}")
+if csv_file is not None:
+    try:
+        participants_hint = parse_attendance_any(csv_file)
+    except Exception as e:
+        st.warning(f"Không đọc được CSV/Excel: {e}")
 
                 st.info("4/5 - Gọi AI tạo JSON theo placeholders (kết hợp transcript + CSV)")
                 llm_result = call_gemini_model(transcript_content, placeholders, participants_hint)
