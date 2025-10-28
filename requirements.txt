@@ -3,4 +3,3 @@ pandas
 python-docx
 google-generativeai
 openpyxl
-docling
